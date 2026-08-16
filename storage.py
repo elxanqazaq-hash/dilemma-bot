@@ -143,6 +143,35 @@ def count_queued():
     return sum(1 for p in data["posts"] if p["status"] == "queued")
 
 
+def count_queued_by_category():
+    data = load_queue()
+    counts = {}
+    for p in data["posts"]:
+        if p["status"] == "queued":
+            counts[p["category"]] = counts.get(p["category"], 0) + 1
+    return counts
+
+
+def clear_queue(count=None):
+    with _lock:
+        data = _read_json(QUEUE_FILE, {"next_id": 1, "posts": []})
+        queued = [p for p in data["posts"] if p["status"] == "queued"]
+        others = [p for p in data["posts"] if p["status"] != "queued"]
+
+        if count is None:
+            removed = len(queued)
+            data["posts"] = others
+        else:
+            count = max(0, count)
+            to_remove = queued[:count]
+            to_keep = queued[count:]
+            removed = len(to_remove)
+            data["posts"] = others + to_keep
+
+        _write_json(QUEUE_FILE, data)
+        return removed
+
+
 def load_stats():
     _ensure_dirs()
     with _lock:
@@ -170,10 +199,14 @@ def update_stat_votes(poll_id, option_a_votes, option_b_votes):
 def load_settings():
     _ensure_dirs()
     with _lock:
-        return _read_json(SETTINGS_FILE, {
+        data = _read_json(SETTINGS_FILE, {
             "paused": False,
             "auto_post_no_moderation": False,
+            "post_slots": None,
         })
+        if "post_slots" not in data:
+            data["post_slots"] = None
+        return data
 
 
 def save_settings(data):
