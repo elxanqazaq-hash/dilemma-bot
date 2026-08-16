@@ -9,7 +9,7 @@ HISTORY_DIR = "history"
 
 CATEGORIES_FILE = os.path.join(STATE_DIR, "categories.json")
 HISTORY_FILE = os.path.join(HISTORY_DIR, "used_pairs.json")
-DAILY_POSTS_FILE = os.path.join(STATE_DIR, "daily_posts.json")
+QUEUE_FILE = os.path.join(STATE_DIR, "queue.json")
 STATS_FILE = os.path.join(STATE_DIR, "stats.json")
 SETTINGS_FILE = os.path.join(STATE_DIR, "settings.json")
 
@@ -78,15 +78,69 @@ def get_recent_pairs_text(limit=60):
     return [f"{p['option_a']} vs {p['option_b']}" for p in recent]
 
 
-def load_daily_posts():
+def load_queue():
     _ensure_dirs()
     with _lock:
-        return _read_json(DAILY_POSTS_FILE, {"date": None, "posts": []})
+        return _read_json(QUEUE_FILE, {"next_id": 1, "posts": []})
 
 
-def save_daily_posts(data):
+def save_queue(data):
     with _lock:
-        _write_json(DAILY_POSTS_FILE, data)
+        _write_json(QUEUE_FILE, data)
+
+
+def add_posts_to_queue(new_posts):
+    with _lock:
+        data = _read_json(QUEUE_FILE, {"next_id": 1, "posts": []})
+        for p in new_posts:
+            p["id"] = data["next_id"]
+            p["status"] = "queued"
+            p["created_at"] = datetime.now().isoformat()
+            data["next_id"] += 1
+            data["posts"].append(p)
+        _write_json(QUEUE_FILE, data)
+        return data
+
+
+def pop_next_queued_post():
+    with _lock:
+        data = _read_json(QUEUE_FILE, {"next_id": 1, "posts": []})
+        for p in data["posts"]:
+            if p["status"] == "queued":
+                p["status"] = "published"
+                _write_json(QUEUE_FILE, data)
+                return p
+        return None
+
+
+def get_post_by_id(post_id):
+    data = load_queue()
+    for p in data["posts"]:
+        if p["id"] == post_id:
+            return p
+    return None
+
+
+def mark_post_published(post_id):
+    with _lock:
+        data = _read_json(QUEUE_FILE, {"next_id": 1, "posts": []})
+        for p in data["posts"]:
+            if p["id"] == post_id:
+                p["status"] = "published"
+                break
+        _write_json(QUEUE_FILE, data)
+
+
+def remove_post_from_queue(post_id):
+    with _lock:
+        data = _read_json(QUEUE_FILE, {"next_id": 1, "posts": []})
+        data["posts"] = [p for p in data["posts"] if p["id"] != post_id]
+        _write_json(QUEUE_FILE, data)
+
+
+def count_queued():
+    data = load_queue()
+    return sum(1 for p in data["posts"] if p["status"] == "queued")
 
 
 def load_stats():
