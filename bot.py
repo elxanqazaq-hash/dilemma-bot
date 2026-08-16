@@ -1,3 +1,21 @@
+"""
+Дилемма-бот: автогенерация постов "выбери одно из двух" с картинками
+в едином стиле, публикация в канал по расписанию из общей очереди.
+
+Флоу:
+  - Ты сам генерируешь пачку постов вперёд командой /generate N
+    (например /generate 30 — сделает 30 постов и положит в очередь)
+  - По расписанию (12:00 и 20:00 каждый день) бот берёт САМЫЙ СТАРЫЙ
+    пост из очереди (FIFO) и публикует его
+  - Модерации нет по умолчанию — посты публикуются автоматически.
+    Если очередь пуста на момент слота — просто ничего не публикуется,
+    придёт уведомление тебе в личку
+  - Кнопка "Опубликовать сейчас" — публикует следующий пост из очереди
+    немедленно, не дожидаясь слота
+
+Запуск: nohup python bot.py > bot.log 2>&1 &
+"""
+
 import logging
 import threading
 from datetime import datetime, time as time_
@@ -21,24 +39,16 @@ logging.basicConfig(
 log = logging.getLogger("dilemmabot")
 
 TZ = pytz.timezone(config.TIMEZONE)
+
 _poll_index = {}
 _publish_lock = threading.Lock()
 
-
-def _today_str():
-    return datetime.now(TZ).strftime("%Y-%m-%d")
+MAX_BATCH_SIZE = 200  # защита от случайного "сгенерируй 100000"
 
 
-def _new_daily_posts_for_today():
-    return {"date": _today_str(), "posts": []}
-
-
-def _make_post_draft(slot_time, category_id=None):
+def _make_post(category_id=None):
     content = generator.generate_full_post(category_id=category_id)
     return {
-        "slot_time": slot_time,
-        "status": "pending",
-        "regeneration_attempts": 0,
         "category": content["category"],
         "category_label": content["category_label"],
         "option_a": content["option_a"],
@@ -48,145 +58,67 @@ def _make_post_draft(slot_time, category_id=None):
     }
 
 
-async def generate_daily_posts(context: ContextTypes.DEFAULT_TYPE):
-    settings = storage.load_settings()
-    if settings.get("paused"):
-        log.info("Бот на паузе — пропускаю генерацию постов дня")
-        return
+async def generate_batch(context: ContextTypes.DEFAULT_TYPE, chat_id: int, count: int):
+    count = max(1, min(count, MAX_BATCH_SIZE))
+    status_msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"⏳ Генерирую {count} постов... это может занять несколько минут.",
+    )
 
-    daily = _new_daily_posts_for_today()
-    for slot in config.POST_SLOTS:
+    made = 0
+    failed = 0
+    new_posts = []
+
+    for i in range(count):
         try:
-            draft = _make_post_draft(slot)
-            daily["posts"].append(draft)
-            storage.add_to_history(draft["option_a"], draft["option_b"], draft["category"])
+            post = _make_post()
+            new_posts.append(post)
+            storage.add_to_history(post["option_a"], post["option_b"], post["category"])
+            made += 1
         except Exception as e:
-            log.exception(f"Ошибка генерации поста на слот {slot}: {e}")
+            failed += 1
+            log.exception(f"Ошибка генерации поста {i+1}/{count}: {e}")
 
-    storage.save_daily_posts(daily)
+        if (i + 1) % 5 == 0 or (i + 1) == count:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=status_msg.message_id,
+                    text=f"⏳ Сгенерировано {i+1}/{count} (ошибок: {failed})...",
+                )
+            except Exception:
+                pass
 
-    if settings.get("auto_post_no_moderation"):
-        for post in daily["posts"]:
-            post["status"] = "approved"
-        storage.save_daily_posts(daily)
-        log.info("Автопостинг без модерации — черновики одобрены автоматически")
-        return
+    if new_posts:
+        storage.add_posts_to_queue(new_posts)
 
-    for i, post in enumerate(daily["posts"]):
-        await _send_draft_for_review(context, i, post)
-
-
-async def _send_draft_for_review(context, index, post):
-    caption = (
-        f"🗂 Черновик на {post['slot_time']}\n"
-        f"Категория: {post['category_label']}\n\n"
-        f"❓ {post['question']}\n"
-        f"🅰️ {post['option_a']}\n"
-        f"🆚\n"
-        f"🅱️ {post['option_b']}"
-    )
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Одобрить", callback_data=f"approve:{index}"),
-        InlineKeyboardButton("🔄 Перегенерировать", callback_data=f"regen:{index}"),
-        InlineKeyboardButton("❌ Отклонить", callback_data=f"reject:{index}"),
-    ]])
-    image_bytes = bytes.fromhex(post["image_bytes_hex"])
-    await context.bot.send_photo(
-        chat_id=config.OWNER_ID,
-        photo=BytesIO(image_bytes),
-        caption=caption,
-        reply_markup=keyboard,
+    queued_total = storage.count_queued()
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"✅ Готово! Добавлено в очередь: {made}, ошибок: {failed}\n"
+            f"Всего в очереди сейчас: {queued_total} постов "
+            f"(хватит на ~{queued_total // len(config.POST_SLOTS)} дней при {len(config.POST_SLOTS)} постах в день)"
+        ),
     )
 
 
-async def on_moderation_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    action, index_str = query.data.split(":")
-    index = int(index_str)
-
-    daily = storage.load_daily_posts()
-    if daily.get("date") != _today_str() or index >= len(daily["posts"]):
-        await query.edit_message_caption(caption="⚠️ Этот черновик устарел.")
+async def cmd_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != config.OWNER_ID:
         return
 
-    post = daily["posts"][index]
-
-    if action == "approve":
-        post["status"] = "approved"
-        storage.save_daily_posts(daily)
-        await query.edit_message_caption(caption=query.message.caption + "\n\n✅ Одобрено, ждёт публикации.")
-
-    elif action == "reject":
-        post["status"] = "rejected"
-        storage.save_daily_posts(daily)
-        await query.edit_message_caption(caption=query.message.caption + "\n\n❌ Отклонено, генерирую замену...")
-        await _regenerate_post(context, index)
-
-    elif action == "regen":
-        await query.edit_message_caption(caption=query.message.caption + "\n\n🔄 Перегенерирую...")
-        await _regenerate_post(context, index)
-
-
-async def _regenerate_post(context, index):
-    daily = storage.load_daily_posts()
-    post = daily["posts"][index]
-
-    post["regeneration_attempts"] += 1
-    if post["regeneration_attempts"] > config.MAX_REGENERATIONS_ON_REJECT:
-        post["status"] = "rejected"
-        storage.save_daily_posts(daily)
-        await context.bot.send_message(
-            chat_id=config.OWNER_ID,
-            text=f"⚠️ Слот {post['slot_time']} — превышен лимит перегенераций. Слот будет пропущен.",
+    args = context.args
+    if not args or not args[0].isdigit():
+        await update.message.reply_text(
+            "Использование: /generate N\nНапример: /generate 30 — сгенерирует 30 постов в очередь."
         )
         return
 
-    try:
-        new_draft = _make_post_draft(post["slot_time"])
-        new_draft["regeneration_attempts"] = post["regeneration_attempts"]
-        daily["posts"][index] = new_draft
-        storage.save_daily_posts(daily)
-        storage.add_to_history(new_draft["option_a"], new_draft["option_b"], new_draft["category"])
-        await _send_draft_for_review(context, index, new_draft)
-    except Exception as e:
-        log.exception(f"Ошибка перегенерации поста {index}: {e}")
-        await context.bot.send_message(
-            chat_id=config.OWNER_ID,
-            text=f"⚠️ Ошибка при перегенерации слота {post['slot_time']}: {e}",
-        )
+    count = int(args[0])
+    await generate_batch(context, update.effective_chat.id, count)
 
 
-async def publish_slot(context: ContextTypes.DEFAULT_TYPE, slot_time: str):
-    with _publish_lock:
-        daily = storage.load_daily_posts()
-        if daily.get("date") != _today_str():
-            log.warning(f"Нет постов на сегодня для слота {slot_time}")
-            return
-
-        index = None
-        for i, p in enumerate(daily["posts"]):
-            if p["slot_time"] == slot_time:
-                index = i
-                break
-        if index is None:
-            return
-
-        post = daily["posts"][index]
-
-        if post["status"] == "published":
-            return
-        if post["status"] == "rejected":
-            log.info(f"Слот {slot_time} отклонён — пропуск")
-            return
-
-        if post["status"] == "pending":
-            post["status"] = "approved"
-
-        post["status"] = "published"
-        storage.save_daily_posts(daily)
-
+async def _publish_post(context: ContextTypes.DEFAULT_TYPE, post: dict, source: str):
     try:
         image_bytes = bytes.fromhex(post["image_bytes_hex"])
         caption = f"{post['question']}\n\n#{post['category']}"
@@ -215,14 +147,39 @@ async def publish_slot(context: ContextTypes.DEFAULT_TYPE, slot_time: str):
         storage.add_stat_entry(stat_entry)
         _poll_index[poll_message.poll.id] = stat_entry
 
-        log.info(f"Опубликован пост слота {slot_time}: {post['option_a']} vs {post['option_b']}")
+        log.info(f"[{source}] Опубликован пост: {post['option_a']} vs {post['option_b']}")
+        return True
 
     except Exception as e:
-        log.exception(f"Ошибка публикации слота {slot_time}: {e}")
+        log.exception(f"[{source}] Ошибка публикации поста id={post.get('id')}: {e}")
         await context.bot.send_message(
             chat_id=config.OWNER_ID,
-            text=f"🔴 Ошибка публикации слота {slot_time}: {e}",
+            text=f"🔴 Ошибка публикации поста: {e}",
         )
+        return False
+
+
+async def publish_from_schedule(context: ContextTypes.DEFAULT_TYPE, slot_time: str):
+    settings = storage.load_settings()
+    if settings.get("paused"):
+        log.info(f"Бот на паузе — пропускаю публикацию слота {slot_time}")
+        return
+
+    with _publish_lock:
+        post = storage.pop_next_queued_post()
+
+    if post is None:
+        log.warning(f"Очередь пуста на момент слота {slot_time}")
+        await context.bot.send_message(
+            chat_id=config.OWNER_ID,
+            text=(
+                f"⚠️ Слот {slot_time}: очередь постов пуста, публиковать нечего.\n"
+                f"Сгенерируй новую пачку: /generate 30"
+            ),
+        )
+        return
+
+    await _publish_post(context, post, source=f"slot:{slot_time}")
 
 
 async def on_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -244,18 +201,22 @@ async def on_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 MAIN_MENU = InlineKeyboardMarkup([
+    [InlineKeyboardButton("📤 Опубликовать сейчас", callback_data="menu:publishnow")],
+    [InlineKeyboardButton("📦 Статус очереди", callback_data="menu:queue")],
     [InlineKeyboardButton("📊 Статистика по категориям", callback_data="menu:stats")],
     [InlineKeyboardButton("⚙️ Категории", callback_data="menu:categories")],
     [InlineKeyboardButton("⏸️ Пауза/Возобновить", callback_data="menu:pause")],
-    [InlineKeyboardButton("🤖 Автопостинг без модерации: вкл/выкл", callback_data="menu:automod")],
-    [InlineKeyboardButton("🚀 Сгенерировать посты дня сейчас", callback_data="menu:gennow")],
 ])
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != config.OWNER_ID:
         return
-    await update.message.reply_text("Меню дилемма-бота:", reply_markup=MAIN_MENU)
+    await update.message.reply_text(
+        "Меню дилемма-бота:\n\nЧтобы сгенерировать пачку постов вперёд — "
+        "команда /generate N (например /generate 30).",
+        reply_markup=MAIN_MENU,
+    )
 
 
 async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -267,21 +228,37 @@ async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _show_stats(query)
     elif action == "categories":
         await _show_categories(query)
+    elif action == "queue":
+        await _show_queue_status(query)
     elif action == "pause":
         settings = storage.load_settings()
         settings["paused"] = not settings.get("paused", False)
         storage.save_settings(settings)
         state = "⏸️ На паузе" if settings["paused"] else "▶️ Активен"
         await query.edit_message_text(f"Статус бота: {state}", reply_markup=MAIN_MENU)
-    elif action == "automod":
-        settings = storage.load_settings()
-        settings["auto_post_no_moderation"] = not settings.get("auto_post_no_moderation", False)
-        storage.save_settings(settings)
-        state = "включён" if settings["auto_post_no_moderation"] else "выключен"
-        await query.edit_message_text(f"Автопостинг без модерации: {state}", reply_markup=MAIN_MENU)
-    elif action == "gennow":
-        await query.edit_message_text("Генерирую посты дня...", reply_markup=MAIN_MENU)
-        await generate_daily_posts(context)
+    elif action == "publishnow":
+        await query.edit_message_text("📤 Публикую следующий пост из очереди...", reply_markup=MAIN_MENU)
+        with _publish_lock:
+            post = storage.pop_next_queued_post()
+        if post is None:
+            await context.bot.send_message(
+                chat_id=config.OWNER_ID,
+                text="⚠️ Очередь пуста. Сгенерируй пачку: /generate 30",
+            )
+        else:
+            await _publish_post(context, post, source="manual")
+
+
+async def _show_queue_status(query):
+    queued = storage.count_queued()
+    days_left = queued // len(config.POST_SLOTS) if config.POST_SLOTS else 0
+    text = (
+        f"📦 В очереди: {queued} постов\n"
+        f"При {len(config.POST_SLOTS)} постах в день хватит примерно на {days_left} дней.\n\n"
+        f"Слоты публикации: {', '.join(config.POST_SLOTS)} ({config.TIMEZONE})\n\n"
+        f"Чтобы добавить ещё: /generate N"
+    )
+    await query.edit_message_text(text, reply_markup=MAIN_MENU)
 
 
 async def _show_stats(query):
@@ -295,11 +272,11 @@ async def _show_stats(query):
         by_category[cat]["votes"] += total
 
     if not by_category:
-        await query.edit_message_text("Пока нет статистики.", reply_markup=MAIN_MENU)
+        await query.edit_message_text("Пока нет статистики — ни один пост ещё не набрал голосов.", reply_markup=MAIN_MENU)
         return
 
     categories = storage.load_categories()["categories"]
-    lines = ["📊 Статистика по категориям:\n"]
+    lines = ["📊 Статистика по категориям (постов / среднее голосов):\n"]
     ranked = sorted(by_category.items(), key=lambda kv: kv[1]["votes"] / kv[1]["posts"], reverse=True)
     for cat_id, d in ranked:
         label = categories.get(cat_id, {}).get("label", cat_id)
@@ -315,28 +292,21 @@ async def _show_categories(query):
     for cat_id, c in data["categories"].items():
         status = "✅" if c.get("enabled", True) else "🚫"
         lines.append(f"{status} {c['label']} — вес {c.get('weight', 1)}")
-    lines.append("\nИзменить веса: nano state/categories.json")
+    lines.append(
+        "\nДля изменения весов/режима отредактируй state/categories.json "
+        "напрямую в Termux."
+    )
     await query.edit_message_text("\n".join(lines), reply_markup=MAIN_MENU)
 
 
 def _make_publish_job(slot_time):
     async def _job(context: ContextTypes.DEFAULT_TYPE):
-        await publish_slot(context, slot_time)
+        await publish_from_schedule(context, slot_time)
     return _job
-
-
-async def _job_generate_wrapper(context: ContextTypes.DEFAULT_TYPE):
-    await generate_daily_posts(context)
 
 
 def setup_schedule(application: Application):
     jq = application.job_queue
-    gen_h, gen_m = map(int, config.GENERATION_TIME.split(":"))
-    jq.run_daily(
-        _job_generate_wrapper,
-        time=time_(hour=gen_h, minute=gen_m, tzinfo=TZ),
-        name="generate_daily_posts",
-    )
     for slot in config.POST_SLOTS:
         h, m = map(int, slot.split(":"))
         jq.run_daily(
@@ -348,13 +318,15 @@ def setup_schedule(application: Application):
 
 def main():
     if not config.BOT_TOKEN or not config.CHANNEL or not config.OWNER_ID or not config.GEMINI_KEY:
-        raise RuntimeError("Не заполнен bot.env — нужны BOT_TOKEN, CHANNEL, OWNER_ID, GEMINI_KEY")
+        raise RuntimeError(
+            "Не заполнен bot.env — нужны BOT_TOKEN, CHANNEL, OWNER_ID, GEMINI_KEY"
+        )
 
     application = Application.builder().token(config.BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("menu", cmd_start))
-    application.add_handler(CallbackQueryHandler(on_moderation_button, pattern=r"^(approve|reject|regen):"))
+    application.add_handler(CommandHandler("generate", cmd_generate))
     application.add_handler(CallbackQueryHandler(on_menu_button, pattern=r"^menu:"))
     application.add_handler(PollAnswerHandler(on_poll_answer))
 
