@@ -237,7 +237,10 @@ async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state = "⏸️ На паузе" if settings["paused"] else "▶️ Активен"
         await query.edit_message_text(f"Статус бота: {state}", reply_markup=MAIN_MENU)
     elif action == "publishnow":
-        await query.edit_message_text("📤 Публикую следующий пост из очереди...", reply_markup=MAIN_MENU)
+        try:
+            await query.edit_message_text("📤 Публикую следующий пост из очереди...", reply_markup=MAIN_MENU)
+        except Exception:
+            pass
         with _publish_lock:
             post = storage.pop_next_queued_post()
         if post is None:
