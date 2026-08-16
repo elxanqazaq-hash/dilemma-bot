@@ -2,18 +2,11 @@
 Дилемма-бот: автогенерация постов "выбери одно из двух" с картинками
 в едином стиле, публикация в канал по расписанию из общей очереди.
 
-Флоу:
-  - Ты сам генерируешь пачку постов вперёд командой /generate N
-    (например /generate 30 — сделает 30 постов и положит в очередь)
-  - По расписанию (12:00 и 20:00 каждый день) бот берёт САМЫЙ СТАРЫЙ
-    пост из очереди (FIFO) и публикует его
-  - Модерации нет по умолчанию — посты публикуются автоматически.
-    Если очередь пуста на момент слота — просто ничего не публикуется,
-    придёт уведомление тебе в личку
-  - Кнопка "Опубликовать сейчас" — публикует следующий пост из очереди
-    немедленно, не дожидаясь слота
-
-Запуск: nohup python bot.py > bot.log 2>&1 &
+Команды:
+  /generate N          — сгенерировать N постов в очередь
+  /slots 09:00,20:00    — задать свои слоты публикации (через запятую)
+  /clear_queue          — удалить ВСЕ посты из очереди
+  /clear_queue N        — удалить N самых старых постов из очереди
 """
 
 import logging
@@ -43,7 +36,15 @@ TZ = pytz.timezone(config.TIMEZONE)
 _poll_index = {}
 _publish_lock = threading.Lock()
 
-MAX_BATCH_SIZE = 200  # защита от случайного "сгенерируй 100000"
+MAX_BATCH_SIZE = 200
+
+
+def _current_slots():
+    settings = storage.load_settings()
+    custom = settings.get("post_slots")
+    if custom:
+        return custom
+    return config.POST_SLOTS
 
 
 def _make_post(category_id=None):
@@ -93,12 +94,14 @@ async def generate_batch(context: ContextTypes.DEFAULT_TYPE, chat_id: int, count
         storage.add_posts_to_queue(new_posts)
 
     queued_total = storage.count_queued()
+    slots = _current_slots()
+    days = queued_total // len(slots) if slots else 0
     await context.bot.send_message(
         chat_id=chat_id,
         text=(
             f"✅ Готово! Добавлено в очередь: {made}, ошибок: {failed}\n"
-            f"Всего в очереди сейчас: {queued_total} постов "
-            f"(хватит на ~{queued_total // len(config.POST_SLOTS)} дней при {len(config.POST_SLOTS)} постах в день)"
+            f"Всего в очереди сейчас: {queued_total} постов (хватит на ~{days} дней "
+            f"при {len(slots)} постах в день)"
         ),
     )
 
@@ -118,10 +121,89 @@ async def cmd_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await generate_batch(context, update.effective_chat.id, count)
 
 
+async def cmd_slots(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != config.OWNER_ID:
+        return
+
+    args = context.args
+    if not args:
+        current = _current_slots()
+        await update.message.reply_text(
+            f"Текущие слоты публикации: {', '.join(current)}\n\n"
+            f"Чтобы изменить: /slots 09:00,13:00,20:00\n"
+            f"Чтобы сбросить на стандартные ({', '.join(config.POST_SLOTS)}): /slots reset"
+        )
+        return
+
+    raw = " ".join(args)
+
+    if raw.strip().lower() == "reset":
+        settings = storage.load_settings()
+        settings["post_slots"] = None
+        storage.save_settings(settings)
+        await update.message.reply_text(f"Слоты сброшены на стандартные: {', '.join(config.POST_SLOTS)}")
+        await _reload_schedule(context.application)
+        return
+
+    candidates = [s.strip() for s in raw.split(",") if s.strip()]
+    valid = []
+    for s in candidates:
+        try:
+            h, m = s.split(":")
+            h, m = int(h), int(m)
+            if 0 <= h <= 23 and 0 <= m <= 59:
+                valid.append(f"{h:02d}:{m:02d}")
+            else:
+                raise ValueError
+        except Exception:
+            await update.message.reply_text(f"⚠️ Неверный формат времени: '{s}'. Используй ЧЧ:ММ, например 09:00.")
+            return
+
+    if not valid:
+        await update.message.reply_text("Не удалось распознать ни одного времени.")
+        return
+
+    settings = storage.load_settings()
+    settings["post_slots"] = sorted(set(valid))
+    storage.save_settings(settings)
+    await update.message.reply_text(f"✅ Новые слоты публикации: {', '.join(settings['post_slots'])}")
+    await _reload_schedule(context.application)
+
+
+async def _reload_schedule(application: Application):
+    jq = application.job_queue
+    for job in jq.jobs():
+        if job.name and job.name.startswith("publish_"):
+            job.schedule_removal()
+
+    for slot in _current_slots():
+        h, m = map(int, slot.split(":"))
+        jq.run_daily(
+            _make_publish_job(slot),
+            time=time_(hour=h, minute=m, tzinfo=TZ),
+            name=f"publish_{slot}",
+        )
+    log.info(f"Расписание обновлено: {_current_slots()}")
+
+
+async def cmd_clear_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != config.OWNER_ID:
+        return
+
+    args = context.args
+    if args and args[0].isdigit():
+        n = int(args[0])
+        removed = storage.clear_queue(count=n)
+        await update.message.reply_text(f"🗑 Удалено {removed} постов из очереди (самые старые).")
+    else:
+        removed = storage.clear_queue(count=None)
+        await update.message.reply_text(f"🗑 Очередь полностью очищена. Удалено постов: {removed}.")
+
+
 async def _publish_post(context: ContextTypes.DEFAULT_TYPE, post: dict, source: str):
     try:
         image_bytes = bytes.fromhex(post["image_bytes_hex"])
-        caption = f"{post['question']}\n\n#{post['category']}"
+        caption = f"#{post['category']}"
 
         await context.bot.send_photo(
             chat_id=config.CHANNEL,
@@ -200,33 +282,57 @@ async def on_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         storage.update_stat_votes(poll_id, entry["option_a_votes"], entry["option_b_votes"])
 
 
-MAIN_MENU = InlineKeyboardMarkup([
-    [InlineKeyboardButton("📤 Опубликовать сейчас", callback_data="menu:publishnow")],
-    [InlineKeyboardButton("📦 Статус очереди", callback_data="menu:queue")],
-    [InlineKeyboardButton("📊 Статистика по категориям", callback_data="menu:stats")],
-    [InlineKeyboardButton("⚙️ Категории", callback_data="menu:categories")],
-    [InlineKeyboardButton("⏸️ Пауза/Возобновить", callback_data="menu:pause")],
-])
+def _main_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📤 Опубликовать сейчас", callback_data="menu:publishnow")],
+        [InlineKeyboardButton("📦 Статус очереди", callback_data="menu:queue")],
+        [InlineKeyboardButton("📊 Статистика по категориям", callback_data="menu:stats")],
+        [InlineKeyboardButton("⚙️ Категории", callback_data="menu:categories")],
+        [InlineKeyboardButton("⏸️ Пауза/Возобновить", callback_data="menu:pause")],
+    ])
+
+
+HELP_TEXT = (
+    "Меню дилемма-бота:\n\n"
+    "/generate N — сгенерировать N постов в очередь\n"
+    "/slots 09:00,20:00 — задать своё расписание публикации\n"
+    "/clear_queue — очистить всю очередь\n"
+    "/clear_queue N — удалить N старых постов из очереди"
+)
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != config.OWNER_ID:
         return
-    await update.message.reply_text(
-        "Меню дилемма-бота:\n\nЧтобы сгенерировать пачку постов вперёд — "
-        "команда /generate N (например /generate 30).",
-        reply_markup=MAIN_MENU,
-    )
+    await update.message.reply_text(HELP_TEXT, reply_markup=_main_menu())
+
+
+async def _safe_edit(query, text, reply_markup=None):
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup)
+    except Exception as e:
+        if "not modified" not in str(e).lower():
+            raise
 
 
 async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    action = query.data.split(":")[1]
+    parts = query.data.split(":")
+    action = parts[1]
 
-    if action == "stats":
+    if action == "backmain":
+        await _safe_edit(query, HELP_TEXT, reply_markup=_main_menu())
+    elif action == "stats":
         await _show_stats(query)
     elif action == "categories":
+        await _show_categories(query)
+    elif action == "togglecat":
+        cat_id = parts[2]
+        data = storage.load_categories()
+        if cat_id in data["categories"]:
+            data["categories"][cat_id]["enabled"] = not data["categories"][cat_id].get("enabled", True)
+            storage.save_categories(data)
         await _show_categories(query)
     elif action == "queue":
         await _show_queue_status(query)
@@ -235,33 +341,39 @@ async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         settings["paused"] = not settings.get("paused", False)
         storage.save_settings(settings)
         state = "⏸️ На паузе" if settings["paused"] else "▶️ Активен"
-        await query.edit_message_text(f"Статус бота: {state}", reply_markup=MAIN_MENU)
+        await _safe_edit(query, f"Статус бота: {state}", reply_markup=_main_menu())
     elif action == "publishnow":
-        try:
-            await query.edit_message_text("📤 Публикую следующий пост из очереди...", reply_markup=MAIN_MENU)
-        except Exception:
-            pass
         with _publish_lock:
             post = storage.pop_next_queued_post()
+
         if post is None:
             await context.bot.send_message(
                 chat_id=config.OWNER_ID,
                 text="⚠️ Очередь пуста. Сгенерируй пачку: /generate 30",
             )
         else:
-            await _publish_post(context, post, source="manual")
+            ok = await _publish_post(context, post, source="manual")
+            if ok:
+                await context.bot.send_message(
+                    chat_id=config.OWNER_ID,
+                    text=f"✅ Опубликовано: {post['option_a']} vs {post['option_b']}",
+                    reply_markup=_main_menu(),
+                )
 
 
 async def _show_queue_status(query):
     queued = storage.count_queued()
-    days_left = queued // len(config.POST_SLOTS) if config.POST_SLOTS else 0
+    slots = _current_slots()
+    days_left = queued // len(slots) if slots else 0
     text = (
         f"📦 В очереди: {queued} постов\n"
-        f"При {len(config.POST_SLOTS)} постах в день хватит примерно на {days_left} дней.\n\n"
-        f"Слоты публикации: {', '.join(config.POST_SLOTS)} ({config.TIMEZONE})\n\n"
-        f"Чтобы добавить ещё: /generate N"
+        f"При {len(slots)} постах в день хватит примерно на {days_left} дней.\n\n"
+        f"Слоты публикации: {', '.join(slots)} ({config.TIMEZONE})\n\n"
+        f"Добавить ещё: /generate N\n"
+        f"Изменить расписание: /slots ЧЧ:ММ,ЧЧ:ММ\n"
+        f"Очистить очередь: /clear_queue [N]"
     )
-    await query.edit_message_text(text, reply_markup=MAIN_MENU)
+    await _safe_edit(query, text, reply_markup=_main_menu())
 
 
 async def _show_stats(query):
@@ -275,7 +387,7 @@ async def _show_stats(query):
         by_category[cat]["votes"] += total
 
     if not by_category:
-        await query.edit_message_text("Пока нет статистики — ни один пост ещё не набрал голосов.", reply_markup=MAIN_MENU)
+        await _safe_edit(query, "Пока нет статистики — ни один пост ещё не набрал голосов.", reply_markup=_main_menu())
         return
 
     categories = storage.load_categories()["categories"]
@@ -286,20 +398,25 @@ async def _show_stats(query):
         avg = d["votes"] / d["posts"]
         lines.append(f"{label}: {d['posts']} постов, в среднем {avg:.1f} голосов")
 
-    await query.edit_message_text("\n".join(lines), reply_markup=MAIN_MENU)
+    await _safe_edit(query, "\n".join(lines), reply_markup=_main_menu())
+
+
+def _categories_keyboard(data, queued_counts):
+    rows = []
+    for cat_id, c in data["categories"].items():
+        mark = "✅" if c.get("enabled", True) else "⬜️"
+        n = queued_counts.get(cat_id, 0)
+        label = f"{mark} {c['label']} ({n} в очереди)"
+        rows.append([InlineKeyboardButton(label, callback_data=f"menu:togglecat:{cat_id}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад в меню", callback_data="menu:backmain")])
+    return InlineKeyboardMarkup(rows)
 
 
 async def _show_categories(query):
     data = storage.load_categories()
-    lines = [f"⚙️ Категории (режим: {data['mode']}):\n"]
-    for cat_id, c in data["categories"].items():
-        status = "✅" if c.get("enabled", True) else "🚫"
-        lines.append(f"{status} {c['label']} — вес {c.get('weight', 1)}")
-    lines.append(
-        "\nДля изменения весов/режима отредактируй state/categories.json "
-        "напрямую в Termux."
-    )
-    await query.edit_message_text("\n".join(lines), reply_markup=MAIN_MENU)
+    queued_counts = storage.count_queued_by_category()
+    text = f"⚙️ Категории (режим выбора: {data['mode']}):\n\nЖми, чтобы включить/выключить категорию."
+    await _safe_edit(query, text, reply_markup=_categories_keyboard(data, queued_counts))
 
 
 def _make_publish_job(slot_time):
@@ -310,7 +427,7 @@ def _make_publish_job(slot_time):
 
 def setup_schedule(application: Application):
     jq = application.job_queue
-    for slot in config.POST_SLOTS:
+    for slot in _current_slots():
         h, m = map(int, slot.split(":"))
         jq.run_daily(
             _make_publish_job(slot),
@@ -330,6 +447,8 @@ def main():
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("menu", cmd_start))
     application.add_handler(CommandHandler("generate", cmd_generate))
+    application.add_handler(CommandHandler("slots", cmd_slots))
+    application.add_handler(CommandHandler("clear_queue", cmd_clear_queue))
     application.add_handler(CallbackQueryHandler(on_menu_button, pattern=r"^menu:"))
     application.add_handler(PollAnswerHandler(on_poll_answer))
 
